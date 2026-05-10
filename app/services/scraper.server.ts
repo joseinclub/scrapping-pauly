@@ -64,7 +64,8 @@ export type HtmlScrapeFallbackReason =
 
 const PAULY_BASE_URL = process.env.PAULY_URL || "https://www.paulylingerie.com";
 const PRODUCTS_PER_PAGE = 250;
-const HTML_FETCH_DELAY_MS = 50;
+// 250ms keeps sequential scrapes ~4 req/s, well under paulylingerie.com Cloudflare 1200/min limit
+const HTML_FETCH_DELAY_MS = 250;
 
 const HTML_FETCH_TIMEOUT_MS = (() => {
   const raw = process.env.PAULY_HTML_FETCH_TIMEOUT_MS;
@@ -74,7 +75,7 @@ const HTML_FETCH_TIMEOUT_MS = (() => {
   return parsed;
 })();
 
-const RETRY_BACKOFF_MS = [500, 2000];
+const RETRY_BACKOFF_MS = [2000, 8000];
 const MAX_ATTEMPTS = 3;
 
 const USE_FULL_PRICE_AS_BASE = process.env.USE_FULL_PRICE_AS_BASE !== "0";
@@ -128,7 +129,17 @@ type AttemptOutcome =
       reason: HtmlScrapeFallbackReason;
       inventoryByVariantId: Map<number, { quantity: number; policy: "DENY" | "CONTINUE" }>;
     }
-  | { kind: "transient"; reason: HtmlScrapeFallbackReason };
+  | { kind: "transient"; reason: HtmlScrapeFallbackReason; retryAfterMs?: number };
+
+function parseRetryAfter(response: Response): number | undefined {
+  const header = response.headers.get("retry-after");
+  if (!header) return undefined;
+  const seconds = Number(header);
+  if (!Number.isNaN(seconds)) return seconds * 1000;
+  const date = Date.parse(header);
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  return undefined;
+}
 
 async function performSingleAttempt(url: string): Promise<AttemptOutcome> {
   let response: Response;
@@ -148,6 +159,9 @@ async function performSingleAttempt(url: string): Promise<AttemptOutcome> {
   }
 
   const status = response.status;
+  if (status === 429 || status === 408) {
+    return { kind: "transient", reason: "5xx", retryAfterMs: parseRetryAfter(response) };
+  }
   if (status >= 400 && status < 500) {
     return {
       kind: "permanent",
@@ -213,9 +227,8 @@ async function scrapeProductMetafields(
       lastTransientReason = outcome.reason;
 
       if (attempt < MAX_ATTEMPTS) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, RETRY_BACKOFF_MS[attempt - 1]),
-        );
+        const delay = outcome.retryAfterMs ?? RETRY_BACKOFF_MS[attempt - 1];
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
 

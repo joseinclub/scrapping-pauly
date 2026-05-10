@@ -119,7 +119,7 @@ export async function logSyncOperation(
     const bulkSuffix = bulkOpId ? ` bulk ${bulkOpId}` : "";
     const errorSuffix =
       errorMessages && errorMessages.length > 0
-        ? ` — ${errorMessages.slice(0, 3).join("; ")}`
+        ? ` — ${errorMessages.join("; ")}`
         : "";
     const message = `${type}${bulkSuffix}${errorSuffix}`;
 
