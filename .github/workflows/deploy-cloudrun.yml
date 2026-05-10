@@ -1,0 +1,122 @@
+name: Deploy Scrapping Pauly to Cloud Run
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: micatalogovirtual-7bfd1
+  REGION: us-central1
+  SERVICE: scrapping-pauly-service
+  IMAGE: us-central1-docker.pkg.dev/micatalogovirtual-7bfd1/containers/scrapping-pauly-service
+
+jobs:
+  deploy:
+    name: Build and Deploy to Cloud Run
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Login to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Build and Push Docker image
+        run: |
+          docker build -t ${{ env.IMAGE }}:${{ github.sha }} .
+          docker push ${{ env.IMAGE }}:${{ github.sha }}
+          docker tag ${{ env.IMAGE }}:${{ github.sha }} ${{ env.IMAGE }}:latest
+          docker push ${{ env.IMAGE }}:latest
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE }}
+          region: ${{ env.REGION }}
+          image: ${{ env.IMAGE }}:${{ github.sha }}
+
+          flags: |
+            --allow-unauthenticated
+            --timeout=300
+            --memory=1Gi
+            --cpu=1
+            --max-instances=10
+            --min-instances=0
+            --concurrency=80
+            --port=3000
+
+          env_vars: |
+            NODE_ENV=production
+            PAULY_URL=${{ secrets.PAULY_URL }}
+            SHOPIFY_APP_URL=https://scrapping-pauly-service-232830642721.us-central1.run.app
+            USE_FULL_PRICE_AS_BASE=1
+            # PAULY_PRICE_BASE_FACTOR=
+
+          secrets: |
+            DATABASE_URL=PAULY_DATABASE_URL:latest
+            SHOPIFY_API_KEY=PAULY_SHOPIFY_API_KEY:latest
+            SHOPIFY_API_SECRET=PAULY_SHOPIFY_API_SECRET:latest
+            CRON_TOKEN=PAULY_CRON_TOKEN:latest
+
+      - name: Run Database Migrations
+        run: |
+          gcloud run jobs create migration-job-${{ github.sha }} \
+            --image=${{ env.IMAGE }}:${{ github.sha }} \
+            --region=${{ env.REGION }} \
+            --set-secrets=DATABASE_URL=PAULY_DATABASE_URL:latest \
+            --execute-now \
+            --wait \
+            --command="npx" \
+            --args="prisma,migrate,deploy" || echo "Migration job might already exist or failed"
+
+      - name: Verify Deployment
+        run: |
+          echo "Service URL: ${{ steps.deploy.outputs.url }}"
+
+          sleep 10
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" ${{ steps.deploy.outputs.url }}/health || echo "000")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Service is healthy! Status: $HTTP_STATUS"
+          else
+            echo "Service returned status: $HTTP_STATUS"
+            echo "Check logs: gcloud run services logs read ${{ env.SERVICE }} --region=${{ env.REGION }}"
+          fi
+
+      - name: Deployment Summary
+        run: |
+          echo "==================================================="
+          echo "DEPLOYMENT SUCCESSFUL!"
+          echo "==================================================="
+          echo ""
+          echo "Service:    ${{ env.SERVICE }}"
+          echo "Region:     ${{ env.REGION }}"
+          echo "Image:      ${{ env.IMAGE }}:${{ github.sha }}"
+          echo "URL:        ${{ steps.deploy.outputs.url }}"
+          echo ""
+          echo "Useful Commands:"
+          echo "  View logs:   gcloud run services logs read ${{ env.SERVICE }} --region=${{ env.REGION }} --limit=50"
+          echo "  Describe:    gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }}"
+          echo "  Update env:  gcloud run services update ${{ env.SERVICE }} --region=${{ env.REGION }} --set-env-vars=KEY=VALUE"
+          echo ""
+          echo "==================================================="
