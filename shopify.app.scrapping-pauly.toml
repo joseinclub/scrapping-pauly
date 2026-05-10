@@ -6,7 +6,7 @@ application_url = "https://scrapping-pauly-service-232830642721.us-central1.run.
 embedded = true
 
 [build]
-automatically_update_urls_on_dev = false
+automatically_update_urls_on_dev = true
 
 [webhooks]
 api_version = "2026-07"
