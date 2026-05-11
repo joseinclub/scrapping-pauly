@@ -50,6 +50,25 @@ Web scraping tool and Shopify sync app for paulylingerie.com (same stack as scra
 - Test backfill and migration scripts via `shopify app dev` tunnel locally before deploying to Cloud Run. Cloud Run services auto-create on first deploy via `google-github-actions/deploy-cloudrun@v2` — no manual pre-creation needed.
 - Prisma migrations must be committed in `prisma/migrations/` before the first deploy. The deploy workflow runs `npx prisma migrate deploy` as a Cloud Run job after each deployment.
 
+## Cloud Scheduler configuration
+
+Cloud Scheduler jobs targeting this app's `/cron` endpoint MUST be configured with `maxRetryAttempts=0` (preferred) or `maxRetryAttempts=1` (maximum acceptable). The default Cloud Scheduler retry policy retries on 5xx responses and is INCORRECT for this endpoint.
+
+A `/cron` request that times out partway through has still successfully DISPATCHED the bulk operation to Shopify (the dispatch is fire-and-forget). A retry would either (i) fail with "another bulk operation is currently running for this shop" because the original op is still in-flight, or (ii) in the narrow window between Shopify accepting the dispatch and the in-progress flag becoming visible, dispatch a duplicate concurrent sync — which is silently expensive and racy. The terminal SyncLog state is written asynchronously by the `bulk_operations/finish` webhook handler (`app/routes/webhooks.bulk-operations.finish.tsx`), so a timeout on the dispatching request does NOT imply the sync failed — only that the HTTP layer gave up waiting on the scrape.
+
+Example `gcloud` command to create a correctly-configured scheduler job:
+
+```bash
+gcloud scheduler jobs create http pauly-sync \
+  --schedule='0 * * * *' \
+  --uri='https://<your-cloud-run-url>/cron?token=<CRON_TOKEN>&shop=<your-shop>.myshopify.com' \
+  --http-method=GET \
+  --max-retry-attempts=0 \
+  --location=us-central1
+```
+
+This setting is an OPERATOR responsibility in the GCP console or `gcloud` CLI when the Cloud Scheduler job is first created or edited. The code does NOT enforce `maxRetryAttempts<=1`; the contract is documentary. Future hardening (e.g. a per-shop lock in the SyncLog table that rejects duplicate dispatches at the application layer) is out of scope for this brief.
+
 ## Known issues
 
 - **InMotion Prisma migrate-deploy**: the MySQL instance on InMotion hosting may require `--skip-generate` flag or a direct `prisma db push` if the Cloud Run migration job fails due to SSL/connection timeouts against InMotion's MySQL. Workaround: run `npx prisma migrate deploy` from a local machine with direct DB access, then deploy the app separately.
@@ -68,3 +87,10 @@ Initial bootstrap of scrapping-pauly, modeled on the post-BRIEF-023 architecture
 - Virgin-tenant first sync: all products created as DRAFT
 - Separate Shopify app and Session DB (multi-tenant safety)
 - Multi-tenant chokepoint via `fetchAllShopifyProducts` filtered by `metafields.custom.pauly_ref:*`
+
+### Async sync via webhook (BRIEF-024 amendment R1)
+
+- `/cron` is fire-and-forget — returns 200 immediately after bulk operations are dispatched to Shopify, without waiting for Shopify-side processing to complete
+- Terminal SyncLog state (`running` -> `completed`/`failed`/`partial`) is written by the new `app/routes/webhooks.bulk-operations.finish.tsx` webhook handler, which receives Shopify's `bulk_operations/finish` webhook topic
+- Cloud Run timeout bumped from 300s to 3600s to accommodate the post-patch-8ce0d8c scrape duration (~9m26s for 444 products with 250ms inter-fetch Cloudflare-mitigation delay)
+- Cloud Scheduler `maxRetryAttempts` MUST be <= 1 — see the [Cloud Scheduler configuration](#cloud-scheduler-configuration) section above for rationale and setup instructions
