@@ -2,8 +2,10 @@ import type { LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import { scrapePaulyProducts } from "~/services/scraper.server";
 import { unauthenticated } from "~/shopify.server";
-import prisma from "~/db.server";
-import { bulkSyncPaulyToShopify } from "~/services/bulk-sync.server";
+import {
+  bulkSyncPaulyToShopify,
+  logSyncOperation,
+} from "~/services/bulk-sync.server";
 
 if (!process.env.CRON_TOKEN) {
   throw new Error("CRON_TOKEN is required but not set in environment");
@@ -51,41 +53,44 @@ async function handleCronRequest(request: Request) {
 
     const scrapedProducts = await scrapePaulyProducts();
 
-    const bulkJobs = await bulkSyncPaulyToShopify(admin, scrapedProducts, shop);
-    if (bulkJobs.existingOperation) {
+    const result = await bulkSyncPaulyToShopify(admin, scrapedProducts, shop);
+    if (result.existingOperation) {
       return json({
         success: false,
         inProgress: true,
-        message: `A bulk operation is already in progress. Status: ${bulkJobs.existingOperation.status}`,
-        operation: bulkJobs.existingOperation,
+        message: `A bulk operation is already in progress. Status: ${result.existingOperation.status}`,
+        operation: result.existingOperation,
       });
     }
 
-    const firstLogId = bulkJobs.logIds[0];
+    const bulkOperationIds: Record<string, string> = {};
+    if (result.createJobId) bulkOperationIds.create = result.createJobId;
+    if (result.updateJobId) bulkOperationIds.update = result.updateJobId;
+    if (result.archiveJobId) bulkOperationIds.archive = result.archiveJobId;
+    if (result.orphanDeleteJobId)
+      bulkOperationIds.orphanDelete = result.orphanDeleteJobId;
 
     return json({
       success: true,
-      message: `Bulk sync started for ${scrapedProducts.length} products`,
-      logId: firstLogId,
-      logIds: bulkJobs.logIds,
-      bulkJobs: {
-        createJobId: bulkJobs.createJobId,
-        updateJobId: bulkJobs.updateJobId,
-      },
+      message: `Bulk sync dispatched (${scrapedProducts.length} products scraped)`,
       stats: {
         scraped: scrapedProducts.length,
       },
+      status: "pending",
+      bulkOperationIds,
+      logId: result.logIds[0],
+      logIds: result.logIds,
     });
   } catch (error) {
     console.error("Bulk sync error:", error);
-    await prisma.syncLog.create({
-      data: {
-        status: "error",
-        message: error instanceof Error ? error.message : "Unknown error",
-        processed: 0,
-        errors: 1,
-      },
-    });
+    await logSyncOperation(
+      "cron-error",
+      null,
+      "failed",
+      0,
+      1,
+      [error instanceof Error ? error.message : "Unknown error"],
+    );
 
     return json(
       {

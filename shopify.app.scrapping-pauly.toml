@@ -19,6 +19,10 @@ api_version = "2026-07"
   topics = [ "app/uninstalled" ]
   uri = "/webhooks/app/uninstalled"
 
+  [[webhooks.subscriptions]]
+  topics = [ "bulk_operations/finish" ]
+  uri = "/webhooks/bulk-operations/finish"
+
 [access_scopes]
 scopes = "read_inventory,read_markets,read_products,write_inventory,write_products"
 

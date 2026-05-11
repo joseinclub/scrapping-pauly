@@ -139,6 +139,22 @@ export async function logSyncOperation(
   }
 }
 
+async function updateRunningLogWithBulkOpId(
+  logId: number,
+  type: string,
+  bulkOpId: string,
+): Promise<void> {
+  if (logId === -1) return;
+  try {
+    await prisma.syncLog.update({
+      where: { id: logId },
+      data: { message: `${type} bulk ${bulkOpId}` },
+    });
+  } catch (error) {
+    console.error("updateRunningLogWithBulkOpId failed:", error);
+  }
+}
+
 export async function ensureMetafieldDefinition(
   admin: ShopifyAdmin,
   shopDomain: string,
@@ -335,16 +351,20 @@ async function waitForCurrentBulkOperation(
   throw new Error("Timed out waiting for current bulk operation slot");
 }
 
+export interface BulkSyncResult {
+  createJobId?: string;
+  updateJobId?: string;
+  archiveJobId?: string;
+  orphanDeleteJobId?: string;
+  existingOperation?: BulkOperationResult;
+  logIds: number[];
+}
+
 export async function bulkSyncPaulyToShopify(
   admin: ShopifyAdmin,
   products: ScrapedProduct[],
   shopDomain: string,
-): Promise<{
-  createJobId?: string;
-  updateJobId?: string;
-  existingOperation?: BulkOperationResult;
-  logIds: number[];
-}> {
+): Promise<BulkSyncResult> {
   await ensureMetafieldDefinition(admin, shopDomain);
 
   const currentOperation = await checkBulkOperationStatus(admin);
@@ -368,45 +388,37 @@ export async function bulkSyncPaulyToShopify(
     `Categorization: ${toCreate.length} toCreate, ${toUpdate.length} toUpdate, ${toArchive.length} toArchive`,
   );
 
-  const jobs: {
-    createJobId?: string;
-    updateJobId?: string;
-    logIds: number[];
-  } = { logIds };
+  const result: BulkSyncResult = { logIds };
 
   if (toCreate.length > 0) {
-    jobs.createJobId = await createBulkProductOperation(
+    result.createJobId = await createBulkProductOperation(
       admin,
       toCreate,
       shopDomain,
       logIds,
     );
-
-    const createFinalStatus = await waitForBulkOperationCompletion(
-      admin,
-      jobs.createJobId,
-    );
-    if (createFinalStatus.status !== "COMPLETED") {
-      throw new Error(
-        `Create bulk operation ${jobs.createJobId} ended with status: ${createFinalStatus.status}`,
-      );
-    }
   }
 
   if (toUpdate.length > 0) {
-    jobs.updateJobId = await createBulkInventoryUpdateOperation(
+    const updateResult = await createBulkInventoryUpdateOperation(
       admin,
       toUpdate,
       shopDomain,
       logIds,
     );
+    result.updateJobId = updateResult.updateJobId;
+    result.orphanDeleteJobId = updateResult.orphanDeleteJobId;
   }
 
   if (toArchive.length > 0) {
-    await archiveMissingProducts(admin, toArchive, logIds);
+    result.archiveJobId = await archiveMissingProducts(
+      admin,
+      toArchive,
+      logIds,
+    );
   }
 
-  return jobs;
+  return result;
 }
 
 export async function fetchAllShopifyProducts(
@@ -709,30 +721,7 @@ async function createBulkProductOperation(
         }`,
       );
 
-      const finalStatus = await waitForBulkOperationCompletion(admin, bulkOpId);
-      if (finalStatus.status !== "COMPLETED") {
-        const failLogId = await logSyncOperation(
-          "create",
-          bulkOpId,
-          "failed",
-          0,
-          products.length,
-          [`bulk op ended with status ${finalStatus.status}`],
-        );
-        if (failLogId !== -1) logIds.push(failLogId);
-        throw new Error(
-          `Create bulk operation ${bulkOpId} ended with status: ${finalStatus.status}`,
-        );
-      }
-
-      const endLogId = await logSyncOperation(
-        "create",
-        bulkOpId,
-        "completed",
-        products.length,
-        0,
-      );
-      if (endLogId !== -1) logIds.push(endLogId);
+      await updateRunningLogWithBulkOpId(startLogId, "create", bulkOpId);
 
       return bulkOpId;
     } finally {
@@ -760,7 +749,7 @@ async function createBulkInventoryUpdateOperation(
   updates: Array<{ product: ScrapedProduct; shopifyData: any }>,
   shopDomain: string,
   logIds: number[],
-): Promise<string> {
+): Promise<{ updateJobId?: string; orphanDeleteJobId?: string }> {
   const startLogId = await logSyncOperation("update", null, "running", 0, 0);
   if (startLogId !== -1) logIds.push(startLogId);
 
@@ -959,7 +948,7 @@ async function createBulkInventoryUpdateOperation(
       0,
     );
     if (endLogId !== -1) logIds.push(endLogId);
-    return "";
+    return {};
   }
 
   const jsonlContent = jsonlLines.join("\n");
@@ -1002,30 +991,7 @@ async function createBulkInventoryUpdateOperation(
       }`,
     );
 
-    const finalStatus = await waitForBulkOperationCompletion(admin, bulkOpId);
-    if (finalStatus.status !== "COMPLETED") {
-      const failLogId = await logSyncOperation(
-        "update",
-        bulkOpId,
-        "failed",
-        0,
-        updates.length,
-        [`bulk op ended with status ${finalStatus.status}`],
-      );
-      if (failLogId !== -1) logIds.push(failLogId);
-      throw new Error(
-        `Update bulk operation ${bulkOpId} ended with status: ${finalStatus.status}`,
-      );
-    }
-
-    const endLogId = await logSyncOperation(
-      "update",
-      bulkOpId,
-      "completed",
-      updates.length,
-      0,
-    );
-    if (endLogId !== -1) logIds.push(endLogId);
+    await updateRunningLogWithBulkOpId(startLogId, "update", bulkOpId);
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error);
     if (!bulkOpId) {
@@ -1048,24 +1014,28 @@ async function createBulkInventoryUpdateOperation(
     const reactivateLogId = await logSyncOperation(
       "reactivate",
       bulkOpId,
-      "completed",
+      "running",
       reactivatedCount,
       0,
     );
     if (reactivateLogId !== -1) logIds.push(reactivateLogId);
   }
 
-  await deleteOrphanVariantsBulk(admin, productsWithOrphans, logIds);
+  const orphanDeleteJobId = await deleteOrphanVariantsBulk(
+    admin,
+    productsWithOrphans,
+    logIds,
+  );
 
-  return bulkOpId;
+  return { updateJobId: bulkOpId || undefined, orphanDeleteJobId };
 }
 
 async function deleteOrphanVariantsBulk(
   admin: ShopifyAdmin,
   productsWithOrphans: Array<{ productId: string; variantIds: string[] }>,
   logIds: number[],
-): Promise<void> {
-  if (productsWithOrphans.length === 0) return;
+): Promise<string | undefined> {
+  if (productsWithOrphans.length === 0) return undefined;
 
   console.log(
     `Deleting orphan variants for ${productsWithOrphans.length} products via bulk operation...`,
@@ -1109,33 +1079,9 @@ async function deleteOrphanVariantsBulk(
       }`,
     );
 
-    const finalStatus = await waitForBulkOperationCompletion(admin, bulkOpId);
+    await updateRunningLogWithBulkOpId(startLogId, "orphan-deletion", bulkOpId);
 
-    if (finalStatus.status !== "COMPLETED") {
-      console.error(
-        `Orphan variant deletion bulk op ${bulkOpId} ended with status ${finalStatus.status}`,
-      );
-      const failLogId = await logSyncOperation(
-        "orphan-deletion",
-        bulkOpId,
-        "failed",
-        0,
-        productsWithOrphans.length,
-        [`bulk op ended with status ${finalStatus.status}`],
-      );
-      if (failLogId !== -1) logIds.push(failLogId);
-      return;
-    }
-
-    console.log("Orphan variant deletion bulk completed");
-    const endLogId = await logSyncOperation(
-      "orphan-deletion",
-      bulkOpId,
-      "completed",
-      productsWithOrphans.length,
-      0,
-    );
-    if (endLogId !== -1) logIds.push(endLogId);
+    return bulkOpId;
   } catch (error) {
     console.error("Orphan variant deletion bulk operation failed:", error);
     const errMsg = error instanceof Error ? error.message : String(error);
@@ -1148,6 +1094,7 @@ async function deleteOrphanVariantsBulk(
       [errMsg],
     );
     if (failLogId !== -1) logIds.push(failLogId);
+    return undefined;
   } finally {
     await unlink(tempFile).catch(() => {});
   }
@@ -1157,8 +1104,8 @@ async function archiveMissingProducts(
   admin: ShopifyAdmin,
   toArchive: Array<{ id: string; title: string }>,
   logIds: number[],
-): Promise<void> {
-  if (toArchive.length === 0) return;
+): Promise<string | undefined> {
+  if (toArchive.length === 0) return undefined;
 
   console.log(
     `Archiving ${toArchive.length} missing products via bulk operation...`,
@@ -1193,35 +1140,9 @@ async function archiveMissingProducts(
       }`,
     );
 
-    const finalStatus = await waitForBulkOperationCompletion(admin, bulkOpId);
+    await updateRunningLogWithBulkOpId(startLogId, "archive", bulkOpId);
 
-    if (finalStatus.status !== "COMPLETED") {
-      console.error(
-        `Archive bulk op ${bulkOpId} ended with status ${finalStatus.status}`,
-      );
-      const failLogId = await logSyncOperation(
-        "archive",
-        bulkOpId,
-        "failed",
-        0,
-        toArchive.length,
-        [`bulk op ended with status ${finalStatus.status}`],
-      );
-      if (failLogId !== -1) logIds.push(failLogId);
-      return;
-    }
-
-    console.log(
-      `Archive bulk operation completed for ${toArchive.length} products`,
-    );
-    const endLogId = await logSyncOperation(
-      "archive",
-      bulkOpId,
-      "completed",
-      toArchive.length,
-      0,
-    );
-    if (endLogId !== -1) logIds.push(endLogId);
+    return bulkOpId;
   } catch (error) {
     console.error("Archive bulk operation failed:", error);
     const errMsg = error instanceof Error ? error.message : String(error);
@@ -1234,6 +1155,7 @@ async function archiveMissingProducts(
       [errMsg],
     );
     if (failLogId !== -1) logIds.push(failLogId);
+    return undefined;
   } finally {
     await unlink(tempFile).catch(() => {});
   }
@@ -1578,6 +1500,7 @@ export async function getBulkOperationDetails(
   objectCount?: number;
   errorCode?: string;
   url?: string;
+  userErrors?: Array<{ field: string[]; message: string }>;
 } | null> {
   const query = `#graphql
     query {
@@ -1589,6 +1512,10 @@ export async function getBulkOperationDetails(
           objectCount
           url
           partialDataUrl
+          userErrors {
+            field
+            message
+          }
         }
       }
     }
@@ -1611,6 +1538,7 @@ export async function getBulkOperationDetails(
     objectCount,
     errorCode: operation.errorCode,
     url: operation.url || operation.partialDataUrl,
+    userErrors: operation.userErrors,
   };
 }
 
@@ -1668,42 +1596,45 @@ export async function updateSyncLogFromOperation(
   status: string,
   objectCount: number,
   errorCode?: string,
+  userErrors?: Array<{ field: string[]; message: string }>,
 ): Promise<void> {
   try {
     const runningLog = await prisma.syncLog.findFirst({
       where: {
         status: "running",
-        message: {
-          contains: operationId,
-        },
+        message: { contains: operationId },
       },
-      orderBy: {
-        createdAt: "desc",
-      },
+      orderBy: { createdAt: "desc" },
     });
 
-    if (!runningLog) {
-      return;
-    }
+    if (!runningLog) return;
 
+    const errCount = userErrors?.length ?? (errorCode ? 1 : 0);
     let finalStatus: string;
-    if (status === "COMPLETED") {
-      finalStatus = "success";
-    } else if (status === "FAILED" || status === "CANCELED") {
-      finalStatus = "error";
+    if (status === "FAILED" || status === "CANCELED") {
+      finalStatus = "failed";
+    } else if (status === "COMPLETED" && errCount > 0) {
+      finalStatus = "partial";
+    } else if (status === "COMPLETED") {
+      finalStatus = "completed";
     } else {
       return;
     }
 
+    const errorTail =
+      userErrors && userErrors.length > 0
+        ? ` — ${userErrors.slice(0, 3).map((e) => e.message).join("; ")}`
+        : errorCode
+          ? ` — Error: ${errorCode}`
+          : "";
+
     await prisma.syncLog.update({
-      where: { id: runningLog.id },
+      where: { id: runningLog.id, status: "running" },
       data: {
         status: finalStatus,
         processed: objectCount,
-        errors: errorCode ? 1 : 0,
-        message: errorCode
-          ? `${runningLog.message} - Error: ${errorCode}`
-          : runningLog.message,
+        errors: errCount,
+        message: `${runningLog.message}${errorTail}`,
       },
     });
   } catch (error) {
