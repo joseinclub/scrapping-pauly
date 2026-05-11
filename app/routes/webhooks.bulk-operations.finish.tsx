@@ -51,7 +51,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       details.status,
       details.objectCount ?? 0,
       details.errorCode,
-      details.userErrors,
     );
   }
 

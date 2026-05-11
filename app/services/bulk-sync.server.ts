@@ -1502,7 +1502,6 @@ export async function getBulkOperationDetails(
   objectCount?: number;
   errorCode?: string;
   url?: string;
-  userErrors?: Array<{ field: string[]; message: string }>;
 } | null> {
   const query = `#graphql
     query {
@@ -1514,10 +1513,6 @@ export async function getBulkOperationDetails(
           objectCount
           url
           partialDataUrl
-          userErrors {
-            field
-            message
-          }
         }
       }
     }
@@ -1540,7 +1535,6 @@ export async function getBulkOperationDetails(
     objectCount,
     errorCode: operation.errorCode,
     url: operation.url || operation.partialDataUrl,
-    userErrors: operation.userErrors,
   };
 }
 
@@ -1598,7 +1592,6 @@ export async function updateSyncLogFromOperation(
   status: string,
   objectCount: number,
   errorCode?: string,
-  userErrors?: Array<{ field: string[]; message: string }>,
 ): Promise<void> {
   try {
     const runningLog = await prisma.syncLog.findFirst({
@@ -1611,11 +1604,10 @@ export async function updateSyncLogFromOperation(
 
     if (!runningLog) return;
 
-    const errCount = userErrors?.length ?? (errorCode ? 1 : 0);
     let finalStatus: string;
     if (status === "FAILED" || status === "CANCELED") {
       finalStatus = "failed";
-    } else if (status === "COMPLETED" && errCount > 0) {
+    } else if (status === "COMPLETED" && errorCode) {
       finalStatus = "partial";
     } else if (status === "COMPLETED") {
       finalStatus = "completed";
@@ -1623,19 +1615,14 @@ export async function updateSyncLogFromOperation(
       return;
     }
 
-    const errorTail =
-      userErrors && userErrors.length > 0
-        ? ` — ${userErrors.slice(0, 3).map((e) => e.message).join("; ")}`
-        : errorCode
-          ? ` — Error: ${errorCode}`
-          : "";
+    const errorTail = errorCode ? ` — Error: ${errorCode}` : "";
 
     await prisma.syncLog.update({
       where: { id: runningLog.id, status: "running" },
       data: {
         status: finalStatus,
         processed: objectCount,
-        errors: errCount,
+        errors: errorCode ? 1 : 0,
         message: `${runningLog.message}${errorTail}`,
       },
     });
