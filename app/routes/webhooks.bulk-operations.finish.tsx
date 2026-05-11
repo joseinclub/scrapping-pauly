@@ -37,8 +37,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     await db.syncLog.update({
       where: { id: row.id, status: "running" },
       data: {
-        status: "completed",
-        message: `${row.message} — webhook received, no admin client`,
+        status: "failed",
+        message: `${row.message} — webhook received but admin client unavailable — final status unverified`,
       },
     });
     return Response.json({ received: true }, { status: 200 });

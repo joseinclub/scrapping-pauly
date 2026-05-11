@@ -356,6 +356,7 @@ export interface BulkSyncResult {
   updateJobId?: string;
   archiveJobId?: string;
   orphanDeleteJobId?: string;
+  reactivatedCount: number;
   existingOperation?: BulkOperationResult;
   logIds: number[];
 }
@@ -374,7 +375,7 @@ export async function bulkSyncPaulyToShopify(
     (currentOperation.status === "RUNNING" ||
       currentOperation.status === "CREATED")
   ) {
-    return { existingOperation: currentOperation, logIds: [] };
+    return { existingOperation: currentOperation, reactivatedCount: 0, logIds: [] };
   }
 
   const logIds: number[] = [];
@@ -388,7 +389,7 @@ export async function bulkSyncPaulyToShopify(
     `Categorization: ${toCreate.length} toCreate, ${toUpdate.length} toUpdate, ${toArchive.length} toArchive`,
   );
 
-  const result: BulkSyncResult = { logIds };
+  const result: BulkSyncResult = { reactivatedCount: 0, logIds };
 
   if (toCreate.length > 0) {
     result.createJobId = await createBulkProductOperation(
@@ -408,6 +409,7 @@ export async function bulkSyncPaulyToShopify(
     );
     result.updateJobId = updateResult.updateJobId;
     result.orphanDeleteJobId = updateResult.orphanDeleteJobId;
+    result.reactivatedCount = updateResult.reactivatedCount;
   }
 
   if (toArchive.length > 0) {
@@ -749,7 +751,7 @@ async function createBulkInventoryUpdateOperation(
   updates: Array<{ product: ScrapedProduct; shopifyData: any }>,
   shopDomain: string,
   logIds: number[],
-): Promise<{ updateJobId?: string; orphanDeleteJobId?: string }> {
+): Promise<{ updateJobId?: string; orphanDeleteJobId?: string; reactivatedCount: number }> {
   const startLogId = await logSyncOperation("update", null, "running", 0, 0);
   if (startLogId !== -1) logIds.push(startLogId);
 
@@ -948,7 +950,7 @@ async function createBulkInventoryUpdateOperation(
       0,
     );
     if (endLogId !== -1) logIds.push(endLogId);
-    return {};
+    return { reactivatedCount: 0 };
   }
 
   const jsonlContent = jsonlLines.join("\n");
@@ -1013,8 +1015,8 @@ async function createBulkInventoryUpdateOperation(
   if (reactivatedCount > 0) {
     const reactivateLogId = await logSyncOperation(
       "reactivate",
-      bulkOpId,
-      "running",
+      null,
+      "completed",
       reactivatedCount,
       0,
     );
@@ -1027,7 +1029,7 @@ async function createBulkInventoryUpdateOperation(
     logIds,
   );
 
-  return { updateJobId: bulkOpId || undefined, orphanDeleteJobId };
+  return { updateJobId: bulkOpId || undefined, orphanDeleteJobId, reactivatedCount };
 }
 
 async function deleteOrphanVariantsBulk(

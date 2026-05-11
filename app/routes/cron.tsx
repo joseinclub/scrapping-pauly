@@ -69,6 +69,8 @@ async function handleCronRequest(request: Request) {
     if (result.archiveJobId) bulkOperationIds.archive = result.archiveJobId;
     if (result.orphanDeleteJobId)
       bulkOperationIds.orphanDelete = result.orphanDeleteJobId;
+    if (result.reactivatedCount > 0 && result.updateJobId)
+      bulkOperationIds.reactivate = result.updateJobId;
 
     return json({
       success: true,
