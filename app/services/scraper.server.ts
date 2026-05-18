@@ -80,6 +80,26 @@ const MAX_ATTEMPTS = 3;
 
 const USE_FULL_PRICE_AS_BASE = process.env.USE_FULL_PRICE_AS_BASE !== "0";
 
+const DEFAULT_USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+
+const USER_AGENT_POOL: readonly string[] = (() => {
+  const raw = process.env.PAULY_USER_AGENT;
+  if (raw === undefined) {
+    return [DEFAULT_USER_AGENT];
+  }
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+})();
+
+function pickUserAgent(): string | undefined {
+  if (USER_AGENT_POOL.length === 0) return undefined;
+  if (USER_AGENT_POOL.length === 1) return USER_AGENT_POOL[0];
+  return USER_AGENT_POOL[Math.floor(Math.random() * USER_AGENT_POOL.length)];
+}
+
 interface ScrapeMetafieldsResult {
   inventoryByVariantId: Map<number, { quantity: number; policy: "DENY" | "CONTINUE" }>;
   reason: HtmlScrapeFallbackReason | null;
@@ -144,11 +164,9 @@ function parseRetryAfter(response: Response): number | undefined {
 async function performSingleAttempt(url: string): Promise<AttemptOutcome> {
   let response: Response;
   try {
+    const userAgent = pickUserAgent();
     response = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-      },
+      headers: userAgent === undefined ? {} : { "User-Agent": userAgent },
       signal: AbortSignal.timeout(HTML_FETCH_TIMEOUT_MS),
     });
   } catch (error) {
@@ -258,11 +276,9 @@ export async function scrapePaulyProducts(): Promise<ScrapedProduct[]> {
   while (true) {
     const url = `${PAULY_BASE_URL}/products.json?limit=${PRODUCTS_PER_PAGE}&page=${page}`;
 
+    const userAgent = pickUserAgent();
     const response = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-      },
+      headers: userAgent === undefined ? {} : { "User-Agent": userAgent },
     });
 
     if (!response.ok) {
