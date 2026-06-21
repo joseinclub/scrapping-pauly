@@ -35,7 +35,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     console.warn(
       `webhooks.bulk-operations.finish: no admin client for ${bulkOpId}`,
     );
-    await db.syncLog.update({
+    await db.syncLog.updateMany({
       where: { id: row.id, status: "running" },
       data: {
         status: "failed",
@@ -62,7 +62,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     console.warn(
       `webhooks.bulk-operations.finish: getBulkOperationDetails returned null for ${bulkOpId}`,
     );
-    await db.syncLog.update({
+    await db.syncLog.updateMany({
       where: { id: row.id, status: "running" },
       data: {
         status: "failed",
