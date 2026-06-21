@@ -50,6 +50,41 @@ Web scraping tool and Shopify sync app for paulylingerie.com (same stack as scra
 - Test backfill and migration scripts via `shopify app dev` tunnel locally before deploying to Cloud Run. Cloud Run services auto-create on first deploy via `google-github-actions/deploy-cloudrun@v2` — no manual pre-creation needed.
 - Prisma migrations must be committed in `prisma/migrations/` before the first deploy. The deploy workflow runs `npx prisma migrate deploy` as a Cloud Run job after each deployment.
 
+## User-Agent configuration
+
+Both HTTP scrape paths against `paulylingerie.com` (the `/products.json` pagination loop and the per-product `/products/{handle}` HTML fetch inside `performSingleAttempt`) send a desktop browser User-Agent header sourced from a single module-level pool. The pool is read from `process.env.PAULY_USER_AGENT` exactly once at module load in `app/services/scraper.server.ts`; the env is never re-read inside the request loop, and both call sites consume the same `pickUserAgent()` helper.
+
+- **Env var name**: `PAULY_USER_AGENT`
+- **Default (env unset)**: `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36` — names Chrome major version 148 (current stable at implementation time). The previous hardcoded value named Chrome 91 from May 2021, which is the kind of stale UA that WAFs increasingly reject — and Cloudflare in front of paulylingerie.com is precisely the class of WAF that will throw 429/403 at an outdated browser fingerprint.
+- **Pool syntax**: a comma-separated list of full User-Agent strings. Each entry is trimmed; empty entries are dropped. When the pool has 2+ entries, one is picked per request via `Math.random()`. When the pool has exactly 1 entry, that entry is used for every request.
+- **Empty-as-disabled escape hatch**: setting the env var to an empty string, only whitespace, or only commas parses to a zero-length pool. In that case both fetch call sites **omit the `User-Agent` header entirely** from their headers object (the runtime sends no UA to the source). This escape hatch is the operator's last-resort lever if a future UA also starts getting WAF-blocked — toggleable via Secret Manager without a code change.
+
+The 429/408 retry classification in `performSingleAttempt` (Retry-After honor, [2000, 8000] ms backoff) is unaffected by this configuration: it operates on the response status independent of which UA was sent.
+
+### Operator examples
+
+Set a single UA via Secret Manager (recommended for production rotation):
+
+```bash
+echo -n 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36' \
+  | gcloud secrets versions add PAULY_USER_AGENT --data-file=-
+```
+
+Set a comma-separated pool of two UAs:
+
+```bash
+echo -n 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36,Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36' \
+  | gcloud secrets versions add PAULY_USER_AGENT --data-file=-
+```
+
+Disable the User-Agent header entirely (escape hatch):
+
+```bash
+echo -n '' | gcloud secrets versions add PAULY_USER_AGENT --data-file=-
+```
+
+After adding a new secret version, redeploy or restart the Cloud Run revision so it picks up the new value (the pool is computed at module load, not per request).
+
 ## Cloud Scheduler configuration
 
 Cloud Scheduler jobs targeting this app's `/cron` endpoint MUST be configured with `maxRetryAttempts=0` (preferred) or `maxRetryAttempts=1` (maximum acceptable). The default Cloud Scheduler retry policy retries on 5xx responses and is INCORRECT for this endpoint.

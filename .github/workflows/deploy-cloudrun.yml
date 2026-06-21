@@ -70,6 +70,7 @@ jobs:
             SHOPIFY_APP_URL=https://scrapping-pauly-service-232830642721.us-central1.run.app
             USE_FULL_PRICE_AS_BASE=1
             # PAULY_PRICE_BASE_FACTOR=
+            # PAULY_USER_AGENT=
 
           secrets: |
             DATABASE_URL=PAULY_DATABASE_URL:latest
