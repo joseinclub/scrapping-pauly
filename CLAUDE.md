@@ -11,6 +11,7 @@ Web scraping tool and Shopify sync app for paulylingerie.com (same stack as scra
 - **Price factor**: `PAULY_PRICE_BASE_FACTOR` env var (default 1.0 when unset/empty/NaN). The `custom.cambio_precio_base` metafield value = `scraped_base_price * factor`.
 - **Multi-tenant chokepoint**: `fetchAllShopifyProducts` filters by `metafields.custom.pauly_ref:*` — ensures no cross-tenant interference with scrapping-bacoa products on the same destination store.
 - **SKU prefix**: `PAULY-` instead of the base template's prefix.
+- **Sets become Shopify bundles**: a Pauly set is a single-variant product whose page groups separate pieces (`select[data-groups-pr-sl]`, one per piece) and whose cart charges the pieces. The scraper resolves those pieces (`components`) and sets the set's base to the sum of their prices; `set-bundles.server.ts` turns the store product into a bundle of the pieces already synced (one "Talla <piece>" option per piece, Shopify derives stock) and only rebuilds it when the pieces change. Bundle products are updated without options, variants or inventory, and their generated variants are never deleted as orphans. Sets whose page shows a single piece stay as regular products.
 
 ## Stack
 - Remix 2 + Vite + TypeScript

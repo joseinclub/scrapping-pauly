@@ -15,6 +15,15 @@ export interface PaulyVariant {
   inventoryPolicy: "DENY" | "CONTINUE" | null;
 }
 
+export interface SetComponent {
+  /** Pauly product id of the piece, the same value the piece carries in custom.pauly_ref. */
+  ref: string;
+  /** Option name the buyer sees on the set, e.g. "Talla Top". */
+  optionName: string;
+  /** Sizes of the piece the set offers. */
+  values: string[];
+}
+
 export interface ScrapedProduct {
   handle: string;
   title: string;
@@ -26,6 +35,8 @@ export interface ScrapedProduct {
   images: string[];
   variants: PaulyVariant[];
   options: Array<{ name: string; values: string[] }>;
+  /** Pieces of a set, when the source sells it as a group of separate products. */
+  components?: SetComponent[];
 }
 
 interface PaulyProductsJsonResponse {
@@ -100,16 +111,33 @@ function pickUserAgent(): string | undefined {
   return USER_AGENT_POOL[Math.floor(Math.random() * USER_AGENT_POOL.length)];
 }
 
+/** One select of a grouped product page: the variant ids of a single piece. */
+type ComponentGroup = number[];
+
 interface ScrapeMetafieldsResult {
   inventoryByVariantId: Map<number, { quantity: number; policy: "DENY" | "CONTINUE" }>;
+  componentGroups: ComponentGroup[];
   reason: HtmlScrapeFallbackReason | null;
   attempts: number;
 }
 
 function parseHtmlForMetafields(html: string): {
   inventoryByVariantId: Map<number, { quantity: number; policy: "DENY" | "CONTINUE" }>;
+  componentGroups: ComponentGroup[];
 } {
   const $ = cheerio.load(html);
+
+  // A set page has no variants of its own to pick: the theme renders one select per
+  // piece (top, panty...) and the cart receives the pieces, not the set.
+  const componentGroups: ComponentGroup[] = [];
+  $("select[data-groups-pr-sl]").each((_, select) => {
+    const variantIds = $(select)
+      .find("option")
+      .map((__, option) => parseInt($(option).attr("value") ?? "", 10))
+      .get()
+      .filter((id: number) => !Number.isNaN(id));
+    if (variantIds.length > 0) componentGroups.push(variantIds);
+  });
 
   const inventoryByVariantId = new Map<
     number,
@@ -136,13 +164,14 @@ function parseHtmlForMetafields(html: string): {
     inventoryByVariantId.set(variantId, { quantity, policy });
   });
 
-  return { inventoryByVariantId };
+  return { inventoryByVariantId, componentGroups };
 }
 
 type AttemptOutcome =
   | {
       kind: "success";
       inventoryByVariantId: Map<number, { quantity: number; policy: "DENY" | "CONTINUE" }>;
+      componentGroups: ComponentGroup[];
     }
   | {
       kind: "permanent";
@@ -199,7 +228,7 @@ async function performSingleAttempt(url: string): Promise<AttemptOutcome> {
     return { kind: "transient", reason: "parse-error" };
   }
 
-  if (parsed.inventoryByVariantId.size === 0) {
+  if (parsed.inventoryByVariantId.size === 0 && parsed.componentGroups.length === 0) {
     return {
       kind: "permanent",
       reason: "empty-result",
@@ -210,6 +239,7 @@ async function performSingleAttempt(url: string): Promise<AttemptOutcome> {
   return {
     kind: "success",
     inventoryByVariantId: parsed.inventoryByVariantId,
+    componentGroups: parsed.componentGroups,
   };
 }
 
@@ -229,6 +259,7 @@ async function scrapeProductMetafields(
       if (outcome.kind === "success") {
         return {
           inventoryByVariantId: outcome.inventoryByVariantId,
+          componentGroups: outcome.componentGroups,
           reason: null,
           attempts: attempt,
         };
@@ -237,6 +268,7 @@ async function scrapeProductMetafields(
       if (outcome.kind === "permanent") {
         return {
           inventoryByVariantId: outcome.inventoryByVariantId,
+          componentGroups: [],
           reason: outcome.reason,
           attempts: attempt,
         };
@@ -252,6 +284,7 @@ async function scrapeProductMetafields(
 
     return {
       inventoryByVariantId: emptyMap(),
+      componentGroups: [],
       reason: lastTransientReason,
       attempts: MAX_ATTEMPTS,
     };
@@ -262,10 +295,56 @@ async function scrapeProductMetafields(
     );
     return {
       inventoryByVariantId: emptyMap(),
+      componentGroups: [],
       reason: "network",
       attempts: MAX_ATTEMPTS,
     };
   }
+}
+
+/** "Top en lycra Aura - Moka" -> "Top"; "Mini falda Lumina - Beige" -> "Mini falda Lumina". */
+function pieceName(title: string): string {
+  return title.split(" - ")[0].split(" en ")[0].trim();
+}
+
+/**
+ * Turns the selects of a set page into the pieces the set is made of, or null when the
+ * set cannot be rebuilt from them.
+ *
+ * WHY: Pauly sells a set as a page that groups separate products and charges each piece
+ * on its own. Only when every piece is a product this sync also carries, with a single
+ * size option, can TML sell the set as a bundle of those same products — the buyer picks
+ * each piece's size and Shopify derives the stock from the pieces. Anything short of that
+ * (a piece missing from the source, a page showing a single piece) keeps today's product.
+ */
+export function resolveSetComponents(
+  product: ScrapedProduct,
+  componentGroups: ComponentGroup[],
+  productByVariantId: Map<number, ScrapedProduct>,
+): SetComponent[] | null {
+  if (product.variants.length !== 1 || componentGroups.length < 2) return null;
+
+  const pieces: Array<{ piece: ScrapedProduct; values: string[] }> = [];
+  for (const group of componentGroups) {
+    const piece = productByVariantId.get(group[0]);
+    if (!piece || piece.ref === product.ref || piece.options.length !== 1) return null;
+
+    const values = group
+      .map((id) => piece.variants.find((v) => v.id === id)?.option1)
+      .filter((value): value is string => Boolean(value));
+    if (values.length !== group.length) return null;
+
+    pieces.push({ piece, values });
+  }
+
+  const usedNames = new Set<string>();
+  return pieces.map(({ piece, values }) => {
+    const baseName = `Talla ${pieceName(piece.title)}`;
+    let optionName = baseName;
+    for (let n = 2; usedNames.has(optionName); n++) optionName = `${baseName} ${n}`;
+    usedNames.add(optionName);
+    return { ref: piece.ref, optionName, values };
+  });
 }
 
 export async function scrapePaulyProducts(): Promise<ScrapedProduct[]> {
@@ -372,6 +451,12 @@ export async function scrapePaulyProducts(): Promise<ScrapedProduct[]> {
     page++;
   }
 
+  const productByVariantId = new Map<number, ScrapedProduct>();
+  for (const product of allProducts) {
+    for (const v of product.variants) productByVariantId.set(v.id, product);
+  }
+  const componentGroupsByRef = new Map<string, ComponentGroup[]>();
+
   for (let i = 0; i < allProducts.length; i++) {
     const product = allProducts[i];
 
@@ -380,6 +465,9 @@ export async function scrapePaulyProducts(): Promise<ScrapedProduct[]> {
     }
 
     const metafields = await scrapeProductMetafields(product.handle);
+    if (metafields.componentGroups.length > 0) {
+      componentGroupsByRef.set(product.ref, metafields.componentGroups);
+    }
 
     if (metafields.reason) {
       console.warn(
@@ -406,6 +494,35 @@ export async function scrapePaulyProducts(): Promise<ScrapedProduct[]> {
       }
     }
   }
+
+  const setsWithoutPieces: string[] = [];
+  for (const [ref, groups] of componentGroupsByRef) {
+    const product = allProducts.find((p) => p.ref === ref);
+    if (!product) continue;
+
+    const components = resolveSetComponents(product, groups, productByVariantId);
+    if (!components) {
+      if (product.variants.length === 1) setsWithoutPieces.push(product.handle);
+      continue;
+    }
+    product.components = components;
+
+    // The set's own price on Pauly is a number typed on the set and is never charged:
+    // the cart bills each piece. The pieces are what TML pays, so they are the base.
+    const piecesTotal = components.reduce((sum, c) => {
+      const piece = allProducts.find((p) => p.ref === c.ref);
+      return sum + (parseFloat(piece?.variants[0]?.price ?? "") || 0);
+    }, 0);
+    product.variants[0].price = piecesTotal.toFixed(2);
+  }
+
+  console.log(
+    JSON.stringify({
+      event: "set-components",
+      sets: allProducts.filter((p) => p.components).length,
+      setsWithoutPieces,
+    }),
+  );
 
   if (fallbacks.length > 0) {
     await logSyncOperation(
