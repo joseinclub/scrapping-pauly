@@ -73,9 +73,14 @@ function sameComponents(
     const selected = selection.values
       .filter((v) => v.selectionStatus === "SELECTED")
       .map((v) => v.value);
+    // Shopify creates no option on the set for a piece offered in a single size
+    // ("Única"): there is nothing to pick, so its parentOption comes back null.
+    const optionMatches =
+      selection.parentOption?.name === d.optionName ||
+      (d.values.length === 1 && selection.parentOption === null);
     return (
       selection.componentOption.id === d.optionId &&
-      selection.parentOption?.name === d.optionName &&
+      optionMatches &&
       selected.length === d.values.length &&
       d.values.every((v) => selected.includes(v))
     );
