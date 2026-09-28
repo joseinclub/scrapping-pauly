@@ -111,7 +111,7 @@ function pickUserAgent(): string | undefined {
   return USER_AGENT_POOL[Math.floor(Math.random() * USER_AGENT_POOL.length)];
 }
 
-/** One select of a grouped product page: the variant ids of a single piece. */
+/** One piece of a grouped product page: the variant ids it offers (one for a single size). */
 type ComponentGroup = number[];
 
 interface ScrapeMetafieldsResult {
@@ -127,14 +127,17 @@ function parseHtmlForMetafields(html: string): {
 } {
   const $ = cheerio.load(html);
 
-  // A set page has no variants of its own to pick: the theme renders one select per
-  // piece (top, panty...) and the cart receives the pieces, not the set.
+  // A set page has no variants of its own to pick: the theme renders one element per
+  // piece (top, panty...) and the cart receives the pieces, not the set. A piece with
+  // sizes is a select; a piece with a single size ("Única") is a hidden input holding
+  // that one variant id.
   const componentGroups: ComponentGroup[] = [];
-  $("select[data-groups-pr-sl]").each((_, select) => {
-    const variantIds = $(select)
-      .find("option")
-      .map((__, option) => parseInt($(option).attr("value") ?? "", 10))
-      .get()
+  $("[data-groups-pr-sl]").each((_, element) => {
+    const values = element.tagName === "select"
+      ? $(element).find("option").map((__, option) => $(option).attr("value")).get()
+      : [$(element).attr("value")];
+    const variantIds = values
+      .map((value) => parseInt(value ?? "", 10))
       .filter((id: number) => !Number.isNaN(id));
     if (variantIds.length > 0) componentGroups.push(variantIds);
   });
