@@ -357,6 +357,7 @@ export interface BulkSyncResult {
   updateJobId?: string;
   archiveJobId?: string;
   orphanDeleteJobId?: string;
+  metafieldsJobId?: string;
   reactivatedCount: number;
   existingOperation?: BulkOperationResult;
   logIds: number[];
@@ -415,6 +416,7 @@ export async function bulkSyncPaulyToShopify(
     );
     result.updateJobId = updateResult.updateJobId;
     result.orphanDeleteJobId = updateResult.orphanDeleteJobId;
+    result.metafieldsJobId = updateResult.metafieldsJobId;
     result.reactivatedCount = updateResult.reactivatedCount;
   }
 
@@ -765,8 +767,19 @@ async function createBulkInventoryUpdateOperation(
   shopDomain: string,
   logIds: number[],
   bundledProductIds: Set<string>,
-): Promise<{ updateJobId?: string; orphanDeleteJobId?: string; reactivatedCount: number }> {
+): Promise<{
+  updateJobId?: string;
+  orphanDeleteJobId?: string;
+  metafieldsJobId?: string;
+  reactivatedCount: number;
+}> {
   const startLogId = await logSyncOperation("update", null, "running", 0, 0);
+
+  // WHY: productSet treats `metafields` as the product's complete list and deletes every
+  // metafield it does not receive, which would erase custom.precio_base_manual on every
+  // run. Updates leave `metafields` out of productSet and upsert ours with metafieldsSet,
+  // which never deletes.
+  const metafieldUpserts: MetafieldsSetBulkEntry[] = [];
   if (startLogId !== -1) logIds.push(startLogId);
 
   const locationId = await getLocationId(admin, shopDomain);
@@ -937,6 +950,7 @@ async function createBulkInventoryUpdateOperation(
     if (pricingMetafields) {
       metafields.push(...pricingMetafields);
     }
+    metafieldUpserts.push(...metafields.map((m) => ({ ownerId: shopifyData.id, ...m })));
 
     const shouldReactivate = shopifyData.status === "ARCHIVED";
     if (shouldReactivate) {
@@ -953,7 +967,6 @@ async function createBulkInventoryUpdateOperation(
         id: shopifyData.id,
         ...(isBundle ? {} : { productOptions, variants }),
         ...(files.length > 0 && { files }),
-        ...(metafields.length > 0 && { metafields }),
         ...(shouldReactivate ? { status: "ACTIVE" } : {}),
       },
     });
@@ -1047,7 +1060,14 @@ async function createBulkInventoryUpdateOperation(
     logIds,
   );
 
-  return { updateJobId: bulkOpId || undefined, orphanDeleteJobId, reactivatedCount };
+  const metafieldsOperation = await runMetafieldsSetBulkOperation(admin, metafieldUpserts, "update-metafields");
+
+  return {
+    updateJobId: bulkOpId || undefined,
+    orphanDeleteJobId,
+    metafieldsJobId: metafieldsOperation.id || undefined,
+    reactivatedCount,
+  };
 }
 
 async function deleteOrphanVariantsBulk(
