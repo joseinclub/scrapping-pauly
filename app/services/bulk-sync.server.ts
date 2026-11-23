@@ -382,11 +382,11 @@ export async function bulkSyncPaulyToShopify(
 
   const logIds: number[] = [];
 
-  const { toCreate, toUpdate, toArchive, existingProducts } =
+  const { toCreate, toUpdate, toArchive, noPublicar, existingProducts } =
     await categorizeProducts(admin, products);
 
   console.log(
-    `Categorization: ${toCreate.length} toCreate, ${toUpdate.length} toUpdate, ${toArchive.length} toArchive`,
+    `Categorization: ${toCreate.length} toCreate, ${toUpdate.length} toUpdate, ${toArchive.length} toArchive, ${noPublicar.length} noPublicar`,
   );
 
   const result: BulkSyncResult = { reactivatedCount: 0, logIds };
@@ -428,6 +428,8 @@ export async function bulkSyncPaulyToShopify(
     );
   }
 
+  await logNoPublicar(noPublicar, logIds);
+
   return result;
 }
 
@@ -459,6 +461,9 @@ export async function fetchAllShopifyProducts(
                 values
               }
               paulyRef: metafield(namespace: "custom", key: "pauly_ref") {
+                value
+              }
+              noPublicar: metafield(namespace: "custom", key: "no_publicar") {
                 value
               }
               variants(first: 100) {
@@ -512,6 +517,11 @@ export async function fetchAllShopifyProducts(
   return productMap;
 }
 
+// The merchant's "No publicar" checkbox (custom.no_publicar, boolean).
+function isNoPublicar(shopifyProduct: any) {
+  return shopifyProduct.noPublicar?.value === "true";
+}
+
 async function categorizeProducts(
   admin: ShopifyAdmin,
   scrapedProducts: ScrapedProduct[],
@@ -519,11 +529,13 @@ async function categorizeProducts(
   toCreate: ScrapedProduct[];
   toUpdate: Array<{ product: ScrapedProduct; shopifyData: any }>;
   toArchive: Array<{ id: string; title: string }>;
+  noPublicar: string[];
   existingProducts: Map<string, any>;
 }> {
   const toCreate: ScrapedProduct[] = [];
   const toUpdate: Array<{ product: ScrapedProduct; shopifyData: any }> = [];
   const toArchive: Array<{ id: string; title: string }> = [];
+  const noPublicar: string[] = [];
 
   const existingProducts = await fetchAllShopifyProducts(admin);
 
@@ -534,9 +546,16 @@ async function categorizeProducts(
     }
   }
 
+  // WHY: an archived product marked "No publicar" gets no update, so it stays archived, and
+  // since it keeps its ref it is never created again. Before the flag, an archived product
+  // that came back on paulylingerie.com went back to ACTIVE on the next run. A flagged draft or
+  // active product syncs as usual, archiving included.
+  // It stays in existingProducts: a set may still use it as a piece.
   for (const product of scrapedProducts) {
     const existing = product.ref ? existingProducts.get(product.ref) : undefined;
-    if (existing) {
+    if (existing && existing.status === "ARCHIVED" && isNoPublicar(existing)) {
+      noPublicar.push(product.ref);
+    } else if (existing) {
       toUpdate.push({ product, shopifyData: existing });
     } else {
       toCreate.push(product);
@@ -549,7 +568,24 @@ async function categorizeProducts(
     }
   }
 
-  return { toCreate, toUpdate, toArchive, existingProducts };
+  return { toCreate, toUpdate, toArchive, noPublicar, existingProducts };
+}
+
+async function logNoPublicar(refs: string[], logIds: number[]) {
+  if (refs.length === 0) return;
+
+  console.log(
+    `Not reactivating ${refs.length} archived products marked custom.no_publicar: ${refs.join(", ")}`,
+  );
+  const logId = await logSyncOperation(
+    "no-publicar",
+    null,
+    "completed",
+    refs.length,
+    0,
+    [`kept archived: ${refs.join(", ")}`],
+  );
+  if (logId !== -1) logIds.push(logId);
 }
 
 async function createBulkProductOperation(
@@ -608,7 +644,7 @@ async function createBulkProductOperation(
 
       const variants = product.variants.map((variant) => {
         const variantOption = variant.option1 || variant.option2 || variant.option3 || "DEFAULT";
-        const sku = `PAULY-${product.ref}-${variantOption}`;
+        const sku = `${product.ref}-${variantOption}`;
 
         const optionValues: Array<{ optionName: string; name: string }> = [];
 
@@ -875,7 +911,7 @@ async function createBulkInventoryUpdateOperation(
 
     const variants = product.variants.map((variant) => {
       const variantOption = variant.option1 || variant.option2 || variant.option3 || "DEFAULT";
-      const sku = `PAULY-${product.ref}-${variantOption}`;
+      const sku = `${product.ref}-${variantOption}`;
 
       const optionValues: Array<{ optionName: string; name: string }> = [];
 
