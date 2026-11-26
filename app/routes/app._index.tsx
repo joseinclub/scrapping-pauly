@@ -59,6 +59,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         details.status,
         details.objectCount || 0,
         details.errorCode,
+        details.url,
       );
 
       const updatedRecentLogs = await prisma.syncLog.findMany({
