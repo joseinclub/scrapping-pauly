@@ -1,5 +1,6 @@
 import * as cheerio from "cheerio";
 import { logSyncOperation } from "./bulk-sync.server";
+import type { SourceImage } from "./source-media.server";
 
 export interface PaulyVariant {
   title: string;
@@ -32,7 +33,8 @@ export interface ScrapedProduct {
   tags: string[];
   productType: string;
   bodyHtml: string;
-  images: string[];
+  /** In the source's order; the key (`shopify:<image id>`) is the image's identity in TML. */
+  images: SourceImage[];
   variants: PaulyVariant[];
   options: Array<{ name: string; values: string[] }>;
   /** Pieces of a set, when the source sells it as a group of separate products. */
@@ -51,7 +53,7 @@ interface PaulyRawProduct {
   tags: string | string[];
   product_type: string;
   options: Array<{ name: string; values: string[] }>;
-  images: Array<{ src: string }>;
+  images: Array<{ id: number; src: string }>;
   variants: Array<{
     id: number;
     title: string;
@@ -386,7 +388,7 @@ export async function scrapePaulyProducts(): Promise<ScrapedProduct[]> {
       // REQ-02: identity from product.id (stable Shopify numeric id), not regex on handle
       const ref = String(raw.id);
 
-      const images = raw.images.map((img) => img.src);
+      const images = raw.images.map((img) => ({ key: `shopify:${img.id}`, url: img.src }));
 
       const variants: PaulyVariant[] = raw.variants.map((v) => {
         const compareAtPrice = v.compare_at_price ?? null;
