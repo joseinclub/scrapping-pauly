@@ -5,6 +5,8 @@ import type { PaulyVariant, ScrapedProduct } from "./scraper.server";
 import { syncSetBundles } from "./set-bundles.server";
 import prisma from "~/db.server";
 import { SOURCE_MEDIA_FIELDS, sourceMediaLogRow, storeMediaState, syncSourceMedia } from "./source-media.server";
+import { completedRowFromResult } from "./bulk-results.server";
+import { resolveCreateHandles } from "./create-handles.server";
 
 interface ShopifyAdmin {
   graphql: (query: string, options?: any) => Promise<Response>;
@@ -392,10 +394,11 @@ export async function bulkSyncPaulyToShopify(
 
   const result: BulkSyncResult = { reactivatedCount: 0, logIds };
 
-  if (toCreate.length > 0) {
+  const handles = await resolveCreateHandles(admin, toCreate, METAFIELD_KEY);
+  if (handles.products.length > 0) {
     result.createJobId = await createBulkProductOperation(
       admin,
-      toCreate,
+      handles.products,
       shopDomain,
       logIds,
     );
@@ -434,6 +437,7 @@ export async function bulkSyncPaulyToShopify(
 
   await logNoPublicar(noPublicar, logIds);
   if (images) await logProductImages(images.summary, logIds);
+  await logCreateHandles(handles, logIds);
 
   return result;
 }
@@ -604,6 +608,26 @@ async function logProductImages(
   if (!row) return;
 
   const logId = await logSyncOperation("images", null, row.status, row.processed, row.errors, [row.message]);
+  if (logId !== -1) logIds.push(logId);
+}
+
+async function logCreateHandles(
+  handles: Awaited<ReturnType<typeof resolveCreateHandles>>,
+  logIds: number[],
+) {
+  const problems = [...handles.skipped, ...handles.unchecked];
+  const detail = [...problems, ...handles.renamed];
+  if (detail.length === 0) return;
+
+  for (const line of detail) console.log(`create-handle: ${line}`);
+  const logId = await logSyncOperation(
+    "create-handle",
+    null,
+    problems.length > 0 ? "partial" : "completed",
+    handles.renamed.length,
+    problems.length,
+    [detail.join("; ")],
+  );
   if (logId !== -1) logIds.push(logId);
 }
 
@@ -1700,6 +1724,7 @@ export async function updateSyncLogFromOperation(
   status: string,
   objectCount: number,
   errorCode?: string,
+  resultUrl?: string,
 ): Promise<void> {
   try {
     const runningLog = await prisma.syncLog.findFirst({
@@ -1724,14 +1749,26 @@ export async function updateSyncLogFromOperation(
     }
 
     const errorTail = errorCode ? ` — Error: ${errorCode}` : "";
+    let processed = objectCount;
+    let errors = errorCode ? 1 : 0;
+    let resultTail = "";
+    if (status === "COMPLETED") {
+      const result = await completedRowFromResult(resultUrl, objectCount);
+      if (result.errors > 0) {
+        finalStatus = result.status;
+        processed = result.processed;
+        errors = result.errors;
+      }
+      resultTail = result.tail;
+    }
 
     await prisma.syncLog.update({
       where: { id: runningLog.id, status: "running" },
       data: {
         status: finalStatus,
-        processed: objectCount,
-        errors: errorCode ? 1 : 0,
-        message: `${runningLog.message}${errorTail}`,
+        processed,
+        errors,
+        message: `${runningLog.message}${errorTail}${resultTail}`,
       },
     });
   } catch (error) {
