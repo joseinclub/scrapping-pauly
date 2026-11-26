@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import type { PaulyVariant, ScrapedProduct } from "./scraper.server";
 import { syncSetBundles } from "./set-bundles.server";
 import prisma from "~/db.server";
+import { SOURCE_MEDIA_FIELDS, sourceMediaLogRow, storeMediaState, syncSourceMedia } from "./source-media.server";
 
 interface ShopifyAdmin {
   graphql: (query: string, options?: any) => Promise<Response>;
@@ -400,6 +401,7 @@ export async function bulkSyncPaulyToShopify(
     );
   }
 
+  let images: Awaited<ReturnType<typeof syncProductImages>> | undefined;
   if (toUpdate.length > 0) {
     const bundledProductIds = await syncSetBundles(
       admin,
@@ -407,12 +409,14 @@ export async function bulkSyncPaulyToShopify(
       existingProducts,
       logIds,
     );
+    images = await syncProductImages(admin, toUpdate);
     const updateResult = await createBulkInventoryUpdateOperation(
       admin,
       toUpdate,
       shopDomain,
       logIds,
       bundledProductIds,
+      images.metafields,
     );
     result.updateJobId = updateResult.updateJobId;
     result.orphanDeleteJobId = updateResult.orphanDeleteJobId;
@@ -429,6 +433,7 @@ export async function bulkSyncPaulyToShopify(
   }
 
   await logNoPublicar(noPublicar, logIds);
+  if (images) await logProductImages(images.summary, logIds);
 
   return result;
 }
@@ -466,6 +471,7 @@ export async function fetchAllShopifyProducts(
               noPublicar: metafield(namespace: "custom", key: "no_publicar") {
                 value
               }
+              ${SOURCE_MEDIA_FIELDS}
               variants(first: 100) {
                 edges {
                   node {
@@ -569,6 +575,36 @@ async function categorizeProducts(
   }
 
   return { toCreate, toUpdate, toArchive, noPublicar, existingProducts };
+}
+
+// A set is reconciled with its own page's images like any product: turning it into a bundle
+// does not touch its media. A product whose page lists no image is left alone.
+async function syncProductImages(
+  admin: ShopifyAdmin,
+  updates: Array<{ product: ScrapedProduct; shopifyData: any }>,
+) {
+  return syncSourceMedia(
+    admin,
+    updates.map(({ product, shopifyData }) => ({
+      productId: shopifyData.id,
+      ref: product.ref,
+      images: product.images,
+      appAlt: product.title,
+      ...storeMediaState(shopifyData),
+    })),
+  );
+}
+
+async function logProductImages(
+  summary: Awaited<ReturnType<typeof syncSourceMedia>>["summary"],
+  logIds: number[],
+) {
+  console.log(JSON.stringify({ event: "images", ...summary, failures: summary.failures.slice(0, 20) }));
+  const row = sourceMediaLogRow(summary);
+  if (!row) return;
+
+  const logId = await logSyncOperation("images", null, row.status, row.processed, row.errors, [row.message]);
+  if (logId !== -1) logIds.push(logId);
 }
 
 async function logNoPublicar(refs: string[], logIds: number[]) {
@@ -698,8 +734,8 @@ async function createBulkProductOperation(
         };
       });
 
-      const files = product.images.map((src) => ({
-        originalSource: src,
+      const files = product.images.map(({ url }) => ({
+        originalSource: url,
         alt: product.title,
         contentType: "IMAGE",
       }));
@@ -803,6 +839,7 @@ async function createBulkInventoryUpdateOperation(
   shopDomain: string,
   logIds: number[],
   bundledProductIds: Set<string>,
+  sourceMediaMetafields: MetafieldsSetBulkEntry[],
 ): Promise<{
   updateJobId?: string;
   orphanDeleteJobId?: string;
@@ -815,7 +852,7 @@ async function createBulkInventoryUpdateOperation(
   // metafield it does not receive, which would erase custom.precio_base_manual on every
   // run. Updates leave `metafields` out of productSet and upsert ours with metafieldsSet,
   // which never deletes.
-  const metafieldUpserts: MetafieldsSetBulkEntry[] = [];
+  const metafieldUpserts: MetafieldsSetBulkEntry[] = [...sourceMediaMetafields];
   if (startLogId !== -1) logIds.push(startLogId);
 
   const locationId = await getLocationId(admin, shopDomain);
@@ -965,12 +1002,6 @@ async function createBulkInventoryUpdateOperation(
       };
     });
 
-    const files = product.images.map((src) => ({
-      originalSource: src,
-      alt: product.title,
-      contentType: "IMAGE",
-    }));
-
     const metafields: PricingMetafield[] = [];
     if (product.ref) {
       metafields.push({
@@ -1002,7 +1033,10 @@ async function createBulkInventoryUpdateOperation(
       input: {
         id: shopifyData.id,
         ...(isBundle ? {} : { productOptions, variants }),
-        ...(files.length > 0 && { files }),
+        // WHY no files: productSet replaces the whole media list with the files it gets, so
+        // sending them on every run deleted and re-uploaded every image each hour and wiped the
+        // photos the merchant added. Existing products' photos are reconciled one by one by
+        // syncProductImages instead.
         ...(shouldReactivate ? { status: "ACTIVE" } : {}),
       },
     });
