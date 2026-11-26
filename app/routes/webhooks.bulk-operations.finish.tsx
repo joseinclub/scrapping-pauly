@@ -52,6 +52,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       details.status,
       details.objectCount ?? 0,
       details.errorCode,
+      details.url,
     );
   } else {
     // WHY: Shopify could not resolve the operation node for this finished webhook
